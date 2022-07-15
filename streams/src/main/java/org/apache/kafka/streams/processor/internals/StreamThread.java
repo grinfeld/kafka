@@ -24,10 +24,7 @@ import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.InvalidOffsetException;
 import org.apache.kafka.clients.consumer.OffsetResetStrategy;
-import org.apache.kafka.common.KafkaException;
-import org.apache.kafka.common.Metric;
-import org.apache.kafka.common.MetricName;
-import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.*;
 import org.apache.kafka.common.errors.UnsupportedVersionException;
 import org.apache.kafka.common.metrics.Sensor;
 import org.apache.kafka.common.serialization.ByteArrayDeserializer;
@@ -47,22 +44,23 @@ import org.apache.kafka.streams.processor.internals.assignment.AssignorError;
 import org.apache.kafka.streams.processor.internals.assignment.ReferenceContainer;
 import org.apache.kafka.streams.processor.internals.metrics.StreamsMetricsImpl;
 import org.apache.kafka.streams.processor.internals.metrics.ThreadMetrics;
+import org.apache.kafka.streams.state.internals.OffsetCheckpoint;
 import org.apache.kafka.streams.state.internals.ThreadCache;
 
-import java.util.Queue;
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.util.*;
 import java.util.function.BiConsumer;
 import org.slf4j.Logger;
+import software.amazon.awssdk.core.ResponseInputStream;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.GetObjectRequest;
+import software.amazon.awssdk.services.s3.model.GetObjectResponse;
 
 import java.time.Duration;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.Set;
-import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -319,6 +317,7 @@ public class StreamThread extends Thread {
     private final AtomicLong cacheResizeSize = new AtomicLong(-1L);
     private final AtomicBoolean leaveGroupRequested = new AtomicBoolean(false);
     private final boolean eosEnabled;
+    private final ExternalStoreRestoration extRest;
 
     public static StreamThread create(final TopologyMetadata topologyMetadata,
                                       final StreamsConfig config,
@@ -413,6 +412,14 @@ public class StreamThread extends Thread {
         taskManager.setMainConsumer(mainConsumer);
         referenceContainer.mainConsumer = mainConsumer;
 
+        ExternalStoreRestoration ext = null;
+        try {
+            ext = config.getConfiguredInstance("external.restore", ExternalStoreRestoration.class);
+            ext.configure(config, stateDirectory);
+        } catch (Exception ignore) {
+            ext = new NoExternalStoreRestoration();
+        }
+
         final StreamThread streamThread = new StreamThread(
             time,
             config,
@@ -431,7 +438,8 @@ public class StreamThread extends Thread {
             referenceContainer.nonFatalExceptionsToHandle,
             shutdownErrorHook,
             streamsUncaughtExceptionHandler,
-            cache::resize
+            cache::resize,
+            ext
         );
 
         return streamThread.updateThreadMetadata(getSharedAdminClientId(clientId));
@@ -454,7 +462,8 @@ public class StreamThread extends Thread {
                         final Queue<StreamsException> nonFatalExceptionsToHandle,
                         final Runnable shutdownErrorHook,
                         final BiConsumer<Throwable, Boolean> streamsUncaughtExceptionHandler,
-                        final java.util.function.Consumer<Long> cacheResizer) {
+                        final java.util.function.Consumer<Long> cacheResizer,
+                        final ExternalStoreRestoration extRest) {
         super(threadId);
         this.stateLock = new Object();
         this.adminClient = adminClient;
@@ -475,6 +484,7 @@ public class StreamThread extends Thread {
         this.shutdownErrorHook = shutdownErrorHook;
         this.streamsUncaughtExceptionHandler = streamsUncaughtExceptionHandler;
         this.cacheResizer = cacheResizer;
+        this.extRest = extRest;
 
         // The following sensors are created here but their references are not stored in this object, since within
         // this object they are not recorded. The sensors are created here so that the stream threads starts with all
@@ -849,6 +859,51 @@ public class StreamThread extends Thread {
         }
     }
 
+    public interface ExternalStoreRestoration extends Configurable {
+        void configure(StreamsConfig config, StateDirectory stateDirectory);
+        void restore(List<Task> tasks);
+    }
+
+    public static class NoExternalStoreRestoration implements ExternalStoreRestoration {
+        @Override public void configure(StreamsConfig config, StateDirectory stateDirectory) {}
+        @Override public void restore(List<Task> tasks) {}
+        @Override public void configure(Map<String, ?> configs) {}
+    }
+
+    public static class S3ExternalStoreRestoration implements ExternalStoreRestoration {
+
+        private String bucket;
+        private String path;
+        private StateDirectory stateDirectory;
+        private Region region;
+
+        @Override
+        public void configure(StreamsConfig config, StateDirectory stateDirectory) {
+            this.stateDirectory = stateDirectory;
+        }
+
+        @Override
+        public void restore(List<Task> tasks) {
+            // new OffsetCheckpoint(stateDirectory.checkpointFileFor(taskId))
+            tasks.stream().filter(t -> t.state() == Task.State.CREATED)
+                .forEach(t -> {
+                    File dir = stateDirectory.getOrCreateDirectoryForTask(t.id());
+                    OffsetCheckpoint offsetCheckpoint = new OffsetCheckpoint(stateDirectory.checkpointFileFor(t.id()));
+
+                    try (ResponseInputStream<GetObjectResponse> dataInputStream =
+                             S3Client.builder().region(region).build()
+                                .getObject(GetObjectRequest.builder()
+                                    .bucket(bucket).key(path + "/" + dir.getPath()).build())) {
+                        Files.copy(dataInputStream, Paths.get(dir.getAbsolutePath() + "...."));
+                    } catch (IOException e) {
+                        throw new RuntimeException(e);
+                    }
+                });
+        }
+
+        @Override public void configure(Map<String, ?> configs) {}
+    }
+
     private void initializeAndRestorePhase() {
         // only try to initialize the assigned tasks
         // if the state is still in PARTITION_ASSIGNED after the poll call
@@ -860,6 +915,9 @@ public class StreamThread extends Thread {
 
             // transit to restore active is idempotent so we can call it multiple times
             changelogReader.enforceRestoreActive();
+
+            // blocking
+            extRest.restore(new ArrayList<>(taskManager.tasks().values()));
 
             if (taskManager.tryToCompleteRestoration(now, partitions -> resetOffsets(partitions, null))) {
                 changelogReader.transitToUpdateStandby();

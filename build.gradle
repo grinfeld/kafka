@@ -1830,6 +1830,10 @@ project(':streams') {
     implementation libs.jacksonAnnotations
     implementation libs.jacksonDatabind
 
+    implementation platform('software.amazon.awssdk:bom:2.15.0')
+    implementation 'software.amazon.awssdk:iam'
+    implementation 'software.amazon.awssdk:s3'
+
     // testCompileOnly prevents streams from exporting a dependency on test-utils, which would cause a dependency cycle
     testCompileOnly project(':streams:test-utils')
     testImplementation project(':clients').sourceSets.test.output
