@@ -47,6 +47,13 @@ public interface Task {
      *          |              |                   |
      *          |              v                   |
      *          |      +-------+-------+           |
+     *          |      | Restoring (1) |     |     |
+     *          |      | ext started   |     |     |
+     *          |      +-------+-------+     |     |
+     *          |              |             |     |
+     *          |              |             |     |
+     *          |              v                   |
+     *          |      +-------+-------+           |
      *          +----- | Restoring (1) | <---+     |
      *          |      +-------+-------+     |     |
      *          |              |             |     |
@@ -67,11 +74,13 @@ public interface Task {
      * </pre>
      */
     enum State {
-        CREATED(1, 3),            // 0
-        RESTORING(2, 3),          // 1
-        RUNNING(3),               // 2
-        SUSPENDED(1, 4),          // 3
-        CLOSED(0);                // 4, we allow CLOSED to transit to CREATED to handle corrupted tasks
+        CREATED(1, 2),            // 0
+        RESTORING_EXTERNAL_STARTED(3,5), // 1
+        RESTORING_EXTERNAL_COMPLETED(4,5), // 2
+        RESTORING(4, 5),          // 3
+        RUNNING(5),               // 4
+        SUSPENDED(1, 6),          // 5
+        CLOSED(0);                // 6, we allow CLOSED to transit to CREATED to handle corrupted tasks
 
         private final Set<Integer> validTransitions = new HashSet<>();
 
@@ -217,7 +226,12 @@ public interface Task {
     State state();
 
     default boolean needsInitializationOrRestoration() {
-        return state() == State.CREATED || state() == State.RESTORING;
+        return state() == State.CREATED || state() == State.RESTORING ||
+                state() == State.RESTORING_EXTERNAL_COMPLETED || state() == State.RESTORING_EXTERNAL_STARTED;
+    }
+
+    default boolean needsInitializationOrRestorationLocal() {
+        return state() == State.RESTORING_EXTERNAL_COMPLETED || state() == State.RESTORING_EXTERNAL_STARTED;
     }
 
     boolean commitNeeded();

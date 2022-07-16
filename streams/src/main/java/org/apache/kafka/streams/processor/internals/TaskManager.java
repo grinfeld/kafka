@@ -1305,6 +1305,10 @@ public class TaskManager {
         return tasks().values().stream().anyMatch(Task::needsInitializationOrRestoration);
     }
 
+    boolean needsRestoreLocal() {
+        return tasks().values().stream().anyMatch(Task::needsInitializationOrRestoration);
+    }
+
     // for testing only
     void addTask(final Task task) {
         tasks.addTask(task);

@@ -884,21 +884,46 @@ public class StreamThread extends Thread {
 
         @Override
         public void restore(List<Task> tasks) {
-            // new OffsetCheckpoint(stateDirectory.checkpointFileFor(taskId))
-            tasks.stream().filter(t -> t.state() == Task.State.CREATED)
-                .forEach(t -> {
-                    File dir = stateDirectory.getOrCreateDirectoryForTask(t.id());
-                    OffsetCheckpoint offsetCheckpoint = new OffsetCheckpoint(stateDirectory.checkpointFileFor(t.id()));
-
-                    try (ResponseInputStream<GetObjectResponse> dataInputStream =
-                             S3Client.builder().region(region).build()
-                                .getObject(GetObjectRequest.builder()
-                                    .bucket(bucket).key(path + "/" + dir.getPath()).build())) {
-                        Files.copy(dataInputStream, Paths.get(dir.getAbsolutePath() + "...."));
-                    } catch (IOException e) {
-                        throw new RuntimeException(e);
+            // todo: need to deal with every task separately and to manage its status (STARTED, DOWNLOADED, COMPLETED)
+            tasks.stream().filter(task -> task.state() == Task.State.CREATED)
+                .forEach(task -> {
+                    if (!s3Needed(task)) {
+                        return;
                     }
+                    if (isEmptyS3OrShortDelta(task)) {
+                        return;
+                    }
+                    copyDataToS3(task);
                 });
+        }
+
+        private void copyDataToS3(Task task) {
+            File dir = stateDirectory.getOrCreateDirectoryForTask(task.id());
+            try (S3Client client = s3Client(); ResponseInputStream<GetObjectResponse> dataInputStream =
+                     client.getObject(getObjectRequest(dir))) {
+                // todo: normal copying data
+                Files.copy(dataInputStream, Paths.get(dir.getAbsolutePath() + "...."));
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        }
+
+        private boolean s3Needed(Task t) {
+            return false;
+        }
+
+        private boolean isEmptyS3OrShortDelta(Task t) {
+            OffsetCheckpoint offsetCheckpoint = new OffsetCheckpoint(stateDirectory.checkpointFileFor(t.id()));
+            return false;
+        }
+
+        private GetObjectRequest getObjectRequest(File dir) {
+            return GetObjectRequest.builder()
+                    .bucket(bucket).key(path + "/" + dir.getPath()).build();
+        }
+
+        private S3Client s3Client() {
+            return S3Client.builder().region(region).build();
         }
 
         @Override public void configure(Map<String, ?> configs) {}
@@ -937,8 +962,10 @@ public class StreamThread extends Thread {
         // we can always let changelog reader try restoring in order to initialize the changelogs;
         // if there's no active restoring or standby updating it would not try to fetch any data
         // After KAFKA-13873, we only restore the not paused tasks.
-        changelogReader.restore(taskManager.notPausedTasks());
-        log.debug("Idempotent restore call done. Thread state has not changed.");
+        if (taskManager().needsRestoreLocal()) {
+            changelogReader.restore(taskManager.notPausedTasks());
+            log.debug("Idempotent restore call done. Thread state has not changed.");
+        }
     }
 
     // Check if the topology has been updated since we last checked, ie via #addNamedTopology or #removeNamedTopology

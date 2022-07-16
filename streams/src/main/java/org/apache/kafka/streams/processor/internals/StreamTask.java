@@ -220,7 +220,19 @@ public class StreamTask extends AbstractTask implements ProcessorNodePunctuator,
      */
     @Override
     public void initializeIfNeeded() {
+        initializeIfNeededExternal();
+        initializeIfNeededLocal();
+    }
+
+    public void initializeIfNeededExternal() {
         if (state() == State.CREATED) {
+            recordCollector.initialize();
+            transitionTo(State.RESTORING_EXTERNAL_STARTED);
+        }
+    }
+
+    public void initializeIfNeededLocal() {
+        if (state() == State.RESTORING_EXTERNAL_COMPLETED) {
             recordCollector.initialize();
 
             StateManagerUtil.registerStateStores(log, logPrefix, topology, stateMgr, stateDirectory, processorContext);
